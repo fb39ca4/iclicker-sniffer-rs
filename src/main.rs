@@ -10,7 +10,7 @@ extern crate itertools;
 
 use std::error::Error;
 use std::io::prelude::*;
-use std::io::{BufReader, BufWriter};
+use std::io::{BufReader, BufWriter, self};
 use std::process::{Command, Stdio};
 use std::option;
 use std::vec::Vec;
@@ -237,7 +237,7 @@ impl<T, I> Iterator for SymbolSync<T, I> where T: Eq + Copy + Default + Display,
 
 struct IclickerDecode<T, I> where T: Copy + Eq + Zero, I: Iterator<Item=T> {
     iterator: I,
-    window: u16,
+    window: u32,
 }
 
 impl<T, I> IclickerDecode<T, I> where T: Copy + Eq + Zero, I: Iterator<Item=T> {
@@ -255,7 +255,7 @@ impl<T, I> Iterator for IclickerDecode<T, I> where T: Copy + Eq + Zero + Partial
     type Item = IclickerPacket;
     fn next(&mut self) -> Option<IclickerPacket> {
         self.window = 0;
-        while (self.window & 0xffff) != 0x5858 {
+        while (self.window & 0xffffff) != 0x858585 {
             let new_bit = match self.iterator.next() {
                 Some(value) => {
                     value > T::zero()
@@ -271,7 +271,7 @@ impl<T, I> Iterator for IclickerDecode<T, I> where T: Copy + Eq + Zero + Partial
             }
         }
         let mut output: IclickerPacket = IclickerPacket::new();
-        for i in 0..52 {
+        for i in 0..40 {
             let new_bit = match self.iterator.next() {
                 Some(value) => {
                     value > T::zero()
@@ -317,7 +317,7 @@ impl IclickerPacket {
         let mut s = String::new();
         for i in 0..self.len {
             s.push_str(&self.get_bit(i).to_string());
-            if i % 4 == 3 {
+            if i % 8 == 7 {
                 s.push_str(" ");
             }
         }
@@ -325,7 +325,7 @@ impl IclickerPacket {
     }
 
     fn vote(&self) -> char {
-        let vote_bits = self.get_range(40, 4);
+        let vote_bits = self.get_range(28, 4);
         match vote_bits {
             0b0001 => 'A',
             0b0101 => 'B',
@@ -337,27 +337,22 @@ impl IclickerPacket {
     }
 
     fn id(&self) -> u32 {
-        let o: usize = 12;
-        let b0: u8 = (
-            (self.get_range(5 + o, 1) << 7) |
-            (self.get_range(15 + o, 1) << 6) |
-            (self.get_range(23 + o, 1) << 5) |
-            (self.get_range(0 + o, 5) << 0)
-        ) as u8;
-        let b1: u8 = (
-            (self.get_range(7 + o, 7) << 1) |
-            (self.get_range(16 + o, 1))
-        ) as u8;
-        let b2: u8 = (
-            (self.get_range(17 + o, 5) << 2) |
-            (self.get_range(27 + o, 1) << 0)
-        ) as u8;
-        let b3: u8 = b0 ^ b1 ^ b2;
-        return  ((b0 as u32) << 24) |
-                ((b1 as u32) << 16) |
-                ((b2 as u32) << 8) |
-                ((b3 as u32) << 0);
+        //scrambled bytes
+        let s0 = self.get_range(0,  8) as u8;
+        let s1 = self.get_range(8,  8) as u8;
+        let s2 = self.get_range(16, 8) as u8;
+        let s3 = self.get_range(24, 8) as u8;
+        //descrambled bytes
+        let d0 = (s0 >> 3) | ((s2 & 1) << 5) | ((s1 & 1) << 6) | ((s0 & 4) << 5);
+        let d1 = (s1 >> 1) | ((s0 & 1) << 7) | (s2 >> 7);
+        //.......................................^.this one is questionable
+        let d2 = ((s2 & 0x7c) << 1) | (s3 >> 5);
+        //.........^..and these ones are not what Gourlay's paper shows
+        let d3 = d0 ^ d1 ^ d2;
+        //return as u32
+        ((d0 as u32) << 24) | ((d1 as u32) << 16) | ((d2 as u32) << 8) | (d3 as u32)
     }
+
 }
 
 fn main() {
@@ -376,7 +371,7 @@ fn main() {
         .stdout(Stdio::piped())
         .stdin(Stdio::null())
         .spawn()
-        .expect("failed to execute process");
+        .expect("failed to execute rtl_sdr process");
 
     let mut demod_file = Box::new(BufWriter::new(File::create(Path::new("demod.csv")).unwrap()));
     let mut bits_file = Box::new(BufWriter::new(File::create(Path::new("bits.csv")).unwrap()));
@@ -388,11 +383,15 @@ fn main() {
         .tuples::<(_,_)>()
         .map(|x| Complex32::new(x.0, x.1));
     let mut stream = SquelchedSamples { iterator: stream, count: 0 };
-    //let mut samples = Demod::new(samples, 32, Some(waterfall_file));
+    //let mut stream = Demod::new(samples, 32, Some(waterfall_file));
     let mut stream = QuadratureDemod::new(stream, Some(demod_file));
     let mut stream = SymbolSync::new(stream.map(|x| if x > 0. {1 as i8} else {-1 as i8}), bit_rate / sample_rate, Some(bits_file));
     let mut stream = IclickerDecode::new(stream);
     for y in stream {
+        /*print!("{}", if y > 0 {1 as i8} else {0 as i8});
+        let stdout = io::stdout();
+        let mut handle = stdout.lock();
+        handle.flush().unwrap();*/
         println!("vote: {}, id: {:08x}, packet contents: {}", y.vote(), y.id(), y.bit_string());
     }
 }
