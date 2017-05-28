@@ -1,9 +1,9 @@
 [package]
-name = "iclicker-sniffer-rs"
+name = "iclicker-sniffer"
 version = "0.1.0"
 authors = ["fb39ca4 <fb39ca4@gmail.com>"]
 
 [dependencies]
 itertools = "0.5.9"
 num = "0.1.36"
-rustfft = "1.0.1"
+clap = "2.20.5"

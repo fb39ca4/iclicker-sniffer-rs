@@ -5,17 +5,18 @@
 
 extern crate core;
 extern crate num;
-extern crate rustfft;
 extern crate itertools;
+extern crate clap;
 
-use std::error::Error;
-use std::io::prelude::*;
-use std::io::{BufReader, BufWriter, self};
+use std::io::{Write, Read, BufReader, BufWriter, self};
 use std::process::{Command, Stdio};
 use std::option;
 use std::vec::Vec;
 use std::boxed::Box;
 use std::fmt::Display;
+use std::path::Path;
+use std::fs::File;
+use std::str::FromStr;
 
 use itertools::Itertools;
 
@@ -25,25 +26,23 @@ use num::traits::Float;
 use num::traits::Zero;
 use core::ops::Neg;
 
-use std::path::Path;
-use std::fs::File;
+use clap::{Arg, App, ArgGroup};
 
-struct SquelchedSamples<I> {
+struct Treshold<I> {
     count: u8,
-    iterator: I,//Iterator<Item=std::io::Result<u8>>,
+    iterator: I,
 }
 
-impl<I> SquelchedSamples<I> where I: Iterator<Item=Complex32> {
+impl<I> Treshold<I> where I: Iterator<Item=Complex32> {
     fn treshold(&self, x: Complex32) -> bool {
         x.norm() > (0.1 as f32)
     }
 }
 
-impl<I> Iterator for SquelchedSamples<I> where I: Iterator<Item=Complex32> {
+impl<I> Iterator for Treshold<I> where I: Iterator<Item=Complex32> {
     type Item = Complex32;
     fn next(&mut self) -> Option<Complex32> {
         loop {
-            //return self.iterator.next();
             let opt = self.iterator.next();
             match opt {
                 Some(value) => (),
@@ -102,76 +101,6 @@ impl<T, I> Iterator for QuadratureDemod<T, I> where T: Neg<Output=T> + Copy + Fl
             None => (),
         }
         Some(freq)
-    }
-}
-
-struct FFTDemod<I> {
-    window_size: usize,
-    iterator: I,
-    window: std::collections::VecDeque<Complex32>,
-    fft_input: Vec<Complex32>,
-    fft_output: Vec<Complex32>,
-    fft: rustfft::FFT<f32>,
-    file: Option<Box<Write>>,
-}
-
-impl<I> FFTDemod<I> where I: Iterator<Item=Complex32> {
-    fn new(samples: I, window_size: usize, file: Option<Box<Write>>) -> FFTDemod<I> {
-        let mut demod_struct = FFTDemod {
-            iterator: samples,
-            window_size: window_size,
-            window: std::collections::VecDeque::with_capacity(window_size),
-            fft_input: vec![Complex32::default(); window_size],
-            fft_output: vec![Complex32::default(); window_size],
-            fft: rustfft::FFT::new(window_size, false),
-            file: file,
-        };
-        demod_struct
-    }
-}
-
-impl<I> Iterator for FFTDemod<I> where I: Iterator<Item=Complex32> {
-    type Item = f32;
-    fn next(&mut self) -> Option<f32> {
-        while self.window.len() < self.window_size {
-            match self.iterator.next() {
-                Some(value) => {
-                    self.window.push_back(value);
-                },
-                None => return None
-            }
-        }
-        for i in 0..self.window.len() {
-            let pos: f32 = 0.5 + (i as f32) - (self.window_size as f32) / 2.;
-            let gaussian_window: f32 = 3.;
-            let window_function: f32 = (-pos * pos / (gaussian_window * gaussian_window)).exp();
-            self.fft_input[i] = self.window[i] * window_function;
-        }
-        self.fft.process(& self.fft_input, &mut self.fft_output);
-        self.window.pop_front();
-        let mut count: f32 = 0.;
-        let mut weighted: f32 = 0.;for n in 0..self.window_size  {
-            let power = self.fft_output[n].norm();
-            count += power;
-            weighted += power * (n as f32 + 0.5);
-        }
-        match self.file {
-            Some(ref mut file) => {
-                for n in 0..self.window_size  {
-                    let power = self.fft_output[n].norm();
-                    count += power;
-                    weighted += power * (n as f32 + 0.5);
-                    //println!("{}", power);
-                    write!(file, "{:.2},", self.fft_output[n].norm()).unwrap();
-                }
-                let treshold = self.window_size as f32 / 2.;
-                let high = (treshold * 1.5) as i32;
-                let low = (treshold * 0.5) as i32;
-                write!(file, "{}\n", if weighted / count > treshold {high} else {low}).unwrap();
-            },
-            None => (),
-        }
-        Some(2. * (weighted / count) / (self.window_size as f32) - 1.)
     }
 }
 
@@ -249,12 +178,11 @@ impl<T, I> IclickerDecode<T, I> where T: Copy + Eq + Zero, I: Iterator<Item=T> {
     }
 }
 
-
-
 impl<T, I> Iterator for IclickerDecode<T, I> where T: Copy + Eq + Zero + PartialOrd + std::fmt::Display, I: Iterator<Item=T> {
     type Item = IclickerPacket;
     fn next(&mut self) -> Option<IclickerPacket> {
         self.window = 0;
+        //0x858585 seems to be the sync word used by iclicker remotes
         while (self.window & 0xffffff) != 0x858585 {
             let new_bit = match self.iterator.next() {
                 Some(value) => {
@@ -355,43 +283,168 @@ impl IclickerPacket {
 
 }
 
+fn channel_to_frequency(value: &str) -> Option<f64> {
+    let frequency = match value.to_uppercase().as_ref() {
+        "AA" => 917, "AB" => 913, "AC" => 914, "AD" => 915,
+        "BA" => 916, "BB" => 919, "BC" => 920, "BD" => 921,
+        "CA" => 922, "CB" => 923, "CC" => 907, "CD" => 908,
+        "DA" => 905, "DB" => 909, "DC" => 911, "DD" => 910,
+        _ => 0,
+    };
+    if frequency > 0 { Some(frequency as f64 * 1e6) }
+    else {
+        match f64::from_str(value) {
+            Ok(number) => Some(number),
+            Err(e) => None
+        }
+    }
+}
+
+fn validate_channel(channel: String) -> Result<(), String> {
+    match channel_to_frequency(channel.as_str()) {
+        Some(frequency) => Ok(()),
+        None => Err(format!("{} is not a valid channel.", channel))
+    }
+}
+
+fn validate_gain(gain: String) -> Result<(), String> {
+    match f64::from_str(gain.as_str()) {
+        Ok(value) => {
+            if value >= 0. {
+                Ok(())
+            }
+            else {
+                Err(format!("Gain must be nonnegative."))
+            }
+        }
+        Err(e) => Err(format!("Gain must be a number."))
+    }
+}
+
+fn validate_sample_rate(sample_rate: String) -> Result<(), String> {
+    match f64::from_str(sample_rate.as_str()) {
+        Ok(value) => {
+            if value > 0. {
+                Ok(())
+            }
+            else {
+                Err(format!("Sample rate must be positive."))
+            }
+        }
+        Err(e) => Err(format!("Sample rate must be a number."))
+    }
+}
+
+fn validate_device_index(device_index: String) -> Result<(), String> {
+    match usize::from_str(device_index.as_str()) {
+        Ok(value) => {
+            Ok(())
+        }
+        Err(e) => Err(format!("Device index must be a positive integer"))
+    }
+}
+
 fn main() {
-    let hw_frequency = 917e6;
-    let sample_rate = 2.048e6;
+    let matches = App::new("Iclicker Sniffer")
+        .version("0.1.0")
+        .author("fb39ca4")
+        .about("Receive iclicker packets with your RTL-SDR")
+        .arg(Arg::with_name("channel")
+            .short("c")
+            .long("channel")
+            .help("Sets the channel to use. Defaults to AA.")
+            /*.possible_value("AA") .possible_value("AB") .possible_value("AC").possible_value("AD")
+            .possible_value("BA") .possible_value("BB") .possible_value("BC").possible_value("BD")
+            .possible_value("CA") .possible_value("CB") .possible_value("CC").possible_value("CD")
+            .possible_value("DA") .possible_value("DB") .possible_value("DC").possible_value("DD")*/
+            .validator(validate_channel)
+            .takes_value(true))
+        .arg(Arg::with_name("gain")
+            .short("g")
+            .long("gain")
+            .help("RTL-SDR gain. Defaults to hardware automatic gain control.")
+            .validator(validate_gain)
+            .takes_value(true))
+        .arg(Arg::with_name("sample_rate")
+            .short("r")
+            .long("sample_rate")
+            .help("RTL-SDR sample rate. Defaults to 2.048 MHz.")
+            .validator(validate_sample_rate)
+            .takes_value(true))
+        .arg(Arg::with_name("device")
+            .short("d")
+            .long("device")
+            .help("RTL-SDR device index.")
+            .validator(validate_device_index)
+            .takes_value(true))
+        .arg(Arg::with_name("stdin")
+            .short("-s")
+            .long("stdin")
+            .help("Read data from stdin rather than from rtl_sdr")
+            .conflicts_with_all(&["channel", "gain", "device_index"])
+            .requires("sample_rate"))
+        .arg(Arg::with_name("output")
+            .short("-o")
+            .long("output")
+            .help("What to output")
+            .possible_value("packets")
+            .possible_value("bits")
+            .default_value("packets")
+            .takes_value(true))
+        .get_matches();
+
+    let input_stream : Box<Read>;
+    let sample_rate;// = 2.048e6;
+    if matches.is_present("stdin") {
+        sample_rate = f64::from_str(matches.value_of("sample_rate").unwrap()).unwrap();
+        input_stream = Box::new(io::stdin());
+    }
+    else {
+        let frequency = channel_to_frequency(matches.value_of("channel").unwrap_or("AA")).unwrap();
+        sample_rate = f64::from_str(matches.value_of("sample_rate").unwrap_or("900001")).unwrap();
+        let mut command = Command::new("rtl_sdr");
+        command.arg("-f").arg(frequency.to_string());
+        command.arg("-s").arg(sample_rate.to_string());
+        if let Some(gain) = matches.value_of("gain") {
+            command.arg("-g").arg(gain);
+        }
+
+        let process = command
+            .arg("-")
+            .stdout(Stdio::piped())
+            .stdin(Stdio::null())
+            .spawn()
+            .expect("failed to execute rtl_sdr process");
+
+        input_stream = Box::new(process.stdout.unwrap());
+    }
+
     let bit_rate = 152.8e3;
-    let process =
-        Command::new("rtl_sdr")
-        .arg("-f")
-        .arg(hw_frequency.to_string())
-        .arg("-s")
-        .arg(sample_rate.to_string())
-        .arg("-g")
-        .arg("5.")
-        .arg("-")
-        .stdout(Stdio::piped())
-        .stdin(Stdio::null())
-        .spawn()
-        .expect("failed to execute rtl_sdr process");
 
     let mut demod_file = Box::new(BufWriter::new(File::create(Path::new("demod.csv")).unwrap()));
-    let mut bits_file = Box::new(BufWriter::new(File::create(Path::new("bits.csv")).unwrap()));
+    //let mut bits_file = Box::new(BufWriter::new(File::create(Path::new("bits.csv")).unwrap()));
 
-    //let mut fft = rustfft::FFT::new(fft_size, false);
-    let input = BufReader::new(process.stdout.unwrap());
-    let mut stream = input.bytes()
+    //let input = BufReader::new(process.stdout.unwrap());
+    let mut stream = input_stream.bytes()
         .map(|x| (x.unwrap() as f32 - 127.5) / 127.5)
         .tuples::<(_,_)>()
         .map(|x| Complex32::new(x.0, x.1));
-    let mut stream = SquelchedSamples { iterator: stream, count: 0 };
-    //let mut stream = Demod::new(samples, 32, Some(waterfall_file));
+    let mut stream = Treshold { iterator: stream, count: 0 };
     let mut stream = QuadratureDemod::new(stream, Some(demod_file));
-    let mut stream = SymbolSync::new(stream.map(|x| if x > 0. {1 as i8} else {-1 as i8}), bit_rate / sample_rate, Some(bits_file));
-    let mut stream = IclickerDecode::new(stream);
-    for y in stream {
-        /*print!("{}", if y > 0 {1 as i8} else {0 as i8});
-        let stdout = io::stdout();
-        let mut handle = stdout.lock();
-        handle.flush().unwrap();*/
-        println!("vote: {}, id: {:08x}, packet contents: {}", y.vote(), y.id(), y.bit_string());
+    let mut stream = SymbolSync::new(stream.map(|x| if x > 0. {1 as i8} else {-1 as i8}), bit_rate / sample_rate, None);
+
+    if matches.value_of("output").unwrap() == "packets" {
+        let mut stream = IclickerDecode::new(stream);
+        for y in stream {
+            println!("vote: {}, id: {:08x}, packet contents: {}", y.vote(), y.id(), y.bit_string());
+        }
+    }
+    else {
+        for y in stream {
+            print!("{}", if y > 0 {1 as i8} else {0 as i8});
+            let stdout = io::stdout();
+            let mut handle = stdout.lock();
+            handle.flush().unwrap();
+        }
     }
 }
