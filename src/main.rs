@@ -397,7 +397,7 @@ fn main() {
     let sample_rate;// = 2.048e6;
     if matches.is_present("stdin") {
         sample_rate = f64::from_str(matches.value_of("sample_rate").unwrap()).unwrap();
-        input_stream = Box::new(io::stdin());
+        input_stream = Box::new(BufReader::new(io::stdin()));
     }
     else {
         let frequency = channel_to_frequency(matches.value_of("channel").unwrap_or("AA")).unwrap();
@@ -416,27 +416,29 @@ fn main() {
             .spawn()
             .expect("failed to execute rtl_sdr process");
 
-        input_stream = Box::new(process.stdout.unwrap());
+        input_stream = Box::new(BufReader::new(process.stdout.unwrap()));
     }
 
     let bit_rate = 152.8e3;
 
-    let mut demod_file = Box::new(BufWriter::new(File::create(Path::new("demod.csv")).unwrap()));
+    //let mut demod_file = Box::new(BufWriter::new(File::create(Path::new("demod.csv")).unwrap()));
     //let mut bits_file = Box::new(BufWriter::new(File::create(Path::new("bits.csv")).unwrap()));
 
-    //let input = BufReader::new(process.stdout.unwrap());
     let mut stream = input_stream.bytes()
         .map(|x| (x.unwrap() as f32 - 127.5) / 127.5)
         .tuples::<(_,_)>()
         .map(|x| Complex32::new(x.0, x.1));
     let mut stream = Treshold { iterator: stream, count: 0 };
-    let mut stream = QuadratureDemod::new(stream, Some(demod_file));
+    let mut stream = QuadratureDemod::new(stream, None);
     let mut stream = SymbolSync::new(stream.map(|x| if x > 0. {1 as i8} else {-1 as i8}), bit_rate / sample_rate, None);
 
     if matches.value_of("output").unwrap() == "packets" {
         let mut stream = IclickerDecode::new(stream);
         for y in stream {
             println!("vote: {}, id: {:08x}, packet contents: {}", y.vote(), y.id(), y.bit_string());
+            let stdout = io::stdout();
+            let mut handle = stdout.lock();
+            handle.flush().unwrap();
         }
     }
     else {
